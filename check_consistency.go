@@ -76,7 +76,7 @@ func (w *CheckConsistency) checkConsistency() {
 		if tikvCount != tiflashCount {
 			panic("checkConsistency failed")
 		}
-		time.Sleep(3 * time.Second)
+		time.Sleep(1 * time.Second)
 	}
 }
 
