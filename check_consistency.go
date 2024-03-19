@@ -2,19 +2,25 @@ package main
 
 import (
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type CheckConsistency struct {
 	tableName      string
 	sqlCreateTable string
+	sqlDropTable   string
 	sqlAddTiflash  string
 	sqlInsert      string
 	sqlSelect      string
 	value          string
 	threadCount    int
 	batchCount     int
+	tableRowsLimit int
 	dbInfo         *Database
+	stop           int32
+	wg             sync.WaitGroup
 }
 
 func newCheckConsistency() CheckConsistency {
@@ -31,24 +37,29 @@ func newCheckConsistency() CheckConsistency {
 			"`i` date DEFAULT NULL," +
 			"`j` datetime DEFAULT NULL," +
 			"PRIMARY KEY (`a`,`c`) /*T![clustered_index] NONCLUSTERED */)",
-		sqlAddTiflash: "alter table other_handle set tiflash replica 2",
-		sqlInsert:     "insert into `other_handle` (`b`, `c`, `d`, `e`, `g`, `h`, `i`, `j`) values",
-		sqlSelect:     "select count(*) from other_handle",
-		value:         fmt.Sprintf("(%d, '%s', '%s', %f, %f, %f, '%s', '%s')", 1, "Hello, World!", "One, Tow, Three, Four...", 3.14, 3.1415926, 3.1415, "2024-01-01", "2024-01-01 00:00:00"),
-		threadCount:   *flagThreadCount,
-		batchCount:    *flagInsertBatchCount,
-		dbInfo:        newDatabase(),
+		sqlDropTable:   "DROP TABLE `other_handle`",
+		sqlAddTiflash:  "alter table other_handle set tiflash replica 2",
+		sqlInsert:      "insert into `other_handle` (`b`, `c`, `d`, `e`, `g`, `h`, `i`, `j`) values",
+		sqlSelect:      "select count(*) from other_handle",
+		value:          fmt.Sprintf("(%d, '%s', '%s', %f, %f, %f, '%s', '%s')", 1, "Hello, World!", "One, Tow, Three, Four...", 3.14, 3.1415926, 3.1415, "2024-01-01", "2024-01-01 00:00:00"),
+		threadCount:    *flagThreadCount,
+		batchCount:     *flagInsertBatchCount,
+		tableRowsLimit: *flagTableRowsLimit,
+		dbInfo:         newDatabase(),
+		stop:           0,
 	}
 }
 
 func (w *CheckConsistency) insertData() {
+	w.wg.Add(1)
+	defer w.wg.Done()
 	c := w.dbInfo.newConnection()
 	defer c.db.Close()
 	sql := fmt.Sprintf("%s %s", w.sqlInsert, w.value)
 	for i := 0; i < w.batchCount-1; i++ {
 		sql += "," + w.value
 	}
-	for {
+	for atomic.LoadInt32(&w.stop) == 0 {
 		c.exec(sql)
 	}
 }
@@ -76,6 +87,11 @@ func (w *CheckConsistency) checkConsistency() {
 		if tikvCount != tiflashCount {
 			panic("checkConsistency failed")
 		}
+		if tikvCount >= uint64(w.tableRowsLimit) {
+			fmt.Printf("count=%d is greater than limit=%d\n", tikvCount, w.tableRowsLimit)
+			atomic.StoreInt32(&w.stop, 1)
+			break
+		}
 		time.Sleep(1 * time.Second)
 	}
 }
@@ -98,10 +114,21 @@ func (w *CheckConsistency) createTable() {
 	}
 }
 
+func (w *CheckConsistency) dropTable() {
+	c := w.dbInfo.newConnection()
+	defer c.db.Close()
+	c.exec(w.sqlDropTable)
+}
+
 func (w *CheckConsistency) insertAndCheck() {
-	w.createTable()
-	for i := 0; i < w.threadCount; i++ {
-		go w.insertData()
+	for {
+		atomic.StoreInt32(&w.stop, 0)
+		w.createTable()
+		for i := 0; i < w.threadCount; i++ {
+			go w.insertData()
+		}
+		w.checkConsistency()
+		w.wg.Wait()
+		w.dropTable()
 	}
-	w.checkConsistency()
 }

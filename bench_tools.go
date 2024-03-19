@@ -14,6 +14,7 @@ var flagDatabase = flag.String("database", "", "")
 var flagWorkload = flag.String("workload", "", "insert_and_check")
 var flagThreadCount = flag.Int("thread_count", 1, "")
 var flagInsertBatchCount = flag.Int("insert_batch_count", 10, "")
+var flagTableRowsLimit = flag.Int("table_rows_limit", 2000000, "")
 
 func main() {
 	flag.Parse()
