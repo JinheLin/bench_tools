@@ -7,14 +7,11 @@ import (
 	"time"
 )
 
-type CheckConsistency struct {
+type CheckConsistency003 struct {
 	tableName      string
 	sqlCreateTable string
-	sqlDropTable   string
-	sqlAddTiflash  string
 	sqlInsert      string
-	sqlSelect      string
-	value          string
+	insertValue    string
 	threadCount    int
 	batchCount     int
 	tableRowsLimit int
@@ -23,8 +20,8 @@ type CheckConsistency struct {
 	wg             sync.WaitGroup
 }
 
-func newCheckConsistency() CheckConsistency {
-	return CheckConsistency{
+func newCheckConsistency003() CheckConsistency003 {
+	return CheckConsistency003{
 		tableName: "other_handle",
 		sqlCreateTable: "CREATE TABLE IF NOT EXISTS `other_handle` (" +
 			"`a` bigint(20) NOT NULL AUTO_INCREMENT," +
@@ -37,11 +34,16 @@ func newCheckConsistency() CheckConsistency {
 			"`i` date DEFAULT NULL," +
 			"`j` datetime DEFAULT NULL," +
 			"PRIMARY KEY (`a`,`c`) /*T![clustered_index] NONCLUSTERED */)",
-		sqlDropTable:   "DROP TABLE `other_handle`",
-		sqlAddTiflash:  "alter table other_handle set tiflash replica 2",
-		sqlInsert:      "insert into `other_handle` (`b`, `c`, `d`, `e`, `g`, `h`, `i`, `j`) values",
-		sqlSelect:      "select count(*) from other_handle",
-		value:          fmt.Sprintf("(%d, '%s', '%s', %f, %f, %f, '%s', '%s')", 1, "Hello, World!", "One, Tow, Three, Four...", 3.14, 3.1415926, 3.1415, "2024-01-01", "2024-01-01 00:00:00"),
+		sqlInsert: "insert into `other_handle` (`b`, `c`, `d`, `e`, `g`, `h`, `i`, `j`) values",
+		insertValue: fmt.Sprintf("(%d, '%s', '%s', %f, %f, %f, '%s', '%s')",
+			1,
+			"0123456789./*-+~!@#$%ﬂ&*()__+=-][{}abcdefghijl;dsdhjhvqervpanzvbxmcnpoiqwieutlkahsfhmzncbvdhaqir411d",
+			"0123456789./*-+~!@#$%ﬂ&*()__+=-][{}abcdefghijl;dsdhjhvqervpanzvbxmcnpoiqwieutlkahsfhmzncbvdhaqir411d",
+			3.14,
+			3.1415926,
+			3.1415,
+			"2024-01-01",
+			"2024-01-01 00:00:00"),
 		threadCount:    *flagThreadCount,
 		batchCount:     *flagInsertBatchCount,
 		tableRowsLimit: *flagTableRowsLimit,
@@ -50,40 +52,34 @@ func newCheckConsistency() CheckConsistency {
 	}
 }
 
-func (w *CheckConsistency) insertData() {
+func (w *CheckConsistency003) insertData() {
 	w.wg.Add(1)
 	defer w.wg.Done()
 	c := w.dbInfo.newConnection()
 	defer c.db.Close()
-	sql := fmt.Sprintf("%s %s", w.sqlInsert, w.value)
+	sql := fmt.Sprintf("%s %s", w.sqlInsert, w.insertValue)
 	for i := 0; i < w.batchCount-1; i++ {
-		sql += "," + w.value
+		sql += "," + w.insertValue
 	}
 	for atomic.LoadInt32(&w.stop) == 0 {
 		c.exec(sql)
 	}
 }
 
-func (w *CheckConsistency) selectCount(c *Connection, engines string) (count uint64) {
-	c.setReadEngines(engines)
-	rows := c.query(w.sqlSelect)
-	defer rows.Close()
-	for rows.Next() {
-		rows.Scan(&count)
-	}
-	return
-}
-
-func (w *CheckConsistency) checkConsistency() {
+func (w *CheckConsistency003) checkConsistency() {
 	c := w.dbInfo.newConnection()
 	defer c.db.Close()
 	for {
 		c.begin()
 		tso := c.getCurrentTSO()
-		tikvCount := w.selectCount(c, "tikv")
-		tiflashCount := w.selectCount(c, "tiflash")
+		t0 := time.Now()
+		tikvCount := c.selectCount(w.tableName, "tikv")
+		t1 := time.Now()
+		tiflashCount := c.selectCount(w.tableName, "tiflash")
+		t2 := time.Now()
 		c.commit()
-		fmt.Printf("tso: %d, tikv: %d, tiflash: %d\n", tso, tikvCount, tiflashCount)
+		fmt.Printf("tso: %d, tikv: %d(%f seconds), tiflash: %d(%f seconds)\n",
+			tso, tikvCount, t1.Sub(t0).Seconds(), tiflashCount, t2.Sub(t1).Seconds())
 		if tikvCount != tiflashCount {
 			panic("checkConsistency failed")
 		}
@@ -96,31 +92,21 @@ func (w *CheckConsistency) checkConsistency() {
 	}
 }
 
-func (w *CheckConsistency) createTable() {
+func (w *CheckConsistency003) createTable() {
 	c := w.dbInfo.newConnection()
 	defer c.db.Close()
 	c.exec(w.sqlCreateTable)
-	c.exec(w.sqlAddTiflash)
-	c.waitTiFlashAvailable(w.tableName)
-	c.exec("set config tikv `coprocessor.region-split-size`='6MiB'")
-	c.exec("set config tiflash `raftstore-proxy.coprocessor.region-split-size`='6MiB'")
-	rows := c.query("show config where name like '%region-split-size%';")
-	for rows.Next() {
-		var t, i, n, v string
-		rows.Scan(&t, &i, &n, &v)
-		if v != "6MiB" {
-			panic(v)
-		}
-	}
+	c.setTableTiFlashReplicaAndWaitAvailable(w.tableName, 2)
+	c.setRegionSize(*flagRegionSize)
 }
 
-func (w *CheckConsistency) dropTable() {
+func (w *CheckConsistency003) dropTable() {
 	c := w.dbInfo.newConnection()
 	defer c.db.Close()
-	c.exec(w.sqlDropTable)
+	c.dropTable(w.tableName)
 }
 
-func (w *CheckConsistency) insertAndCheck() {
+func (w *CheckConsistency003) insertAndCheck() {
 	for {
 		atomic.StoreInt32(&w.stop, 0)
 		w.createTable()

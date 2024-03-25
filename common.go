@@ -86,7 +86,7 @@ func (c *Connection) getCurrentTSO() (tso uint64) {
 	return
 }
 
-func (c *Connection) getTiFlashAvailable(table string) (available int) {
+func (c *Connection) getTableAvailable(table string) (available int) {
 	sql := fmt.Sprintf("select AVAILABLE from information_schema.tiflash_replica where TABLE_NAME='%s' and TABLE_SCHEMA='%s'", table, c.database)
 	rows := c.query(sql)
 	defer rows.Close()
@@ -96,10 +96,75 @@ func (c *Connection) getTiFlashAvailable(table string) (available int) {
 	return
 }
 
-func (c *Connection) waitTiFlashAvailable(table string) {
-	for c.getTiFlashAvailable(table) != 1 {
+func (c *Connection) getDatabaseAvailable() (available int) {
+	sql := fmt.Sprintf("select AVAILABLE from information_schema.tiflash_replica where TABLE_SCHEMA='%s'", c.database)
+	rows := c.query(sql)
+	defer rows.Close()
+	for rows.Next() {
+		rows.Scan(&available)
+		if available == 0 {
+			return
+		}
+	}
+	return
+}
+
+func (c *Connection) waitTableAvailable(table string) {
+	for c.getTableAvailable(table) != 1 {
 		fmt.Printf("%s is not available\n", table)
 		time.Sleep(1 * time.Second)
 	}
 	fmt.Printf("%s is available\n", table)
+}
+
+func (c *Connection) waitDatabaseAvailable() {
+	for c.getDatabaseAvailable() != 1 {
+		fmt.Printf("%s is not available\n", c.database)
+		time.Sleep(1 * time.Second)
+	}
+	fmt.Printf("%s is available\n", c.database)
+}
+
+func (c *Connection) setTableTiFlashReplicaAndWaitAvailable(table string, count int) {
+	sql := fmt.Sprintf("alter table %s set tiflash replica %d", table, count)
+	c.exec(sql)
+	c.waitTableAvailable(table)
+}
+
+func (c *Connection) setDatabaseTiFlashReplicaAndWaitAvailable(database string, count int) {
+	sql := fmt.Sprintf("alter database %s set tiflash replica %d", database, count)
+	c.exec(sql)
+	c.waitDatabaseAvailable()
+}
+
+func (c *Connection) dropTable(table string) {
+	sql := fmt.Sprintf("drop table `%s`", table)
+	c.exec(sql)
+}
+
+func (c *Connection) selectCount(table string, engines string) (count uint64) {
+	if len(engines) > 0 {
+		c.setReadEngines(engines)
+	}
+	rows := c.query(fmt.Sprintf("select count(*) from `%s`", table))
+	defer rows.Close()
+	for rows.Next() {
+		rows.Scan(&count)
+	}
+	return
+}
+
+func (c * Connection) setRegionSize(regionSize string) {
+	if len(regionSize) > 0 {
+		c.exec(fmt.Sprintf("set config tikv `coprocessor.region-split-size`='%s'", regionSize))
+		c.exec(fmt.Sprintf("set config tiflash `raftstore-proxy.coprocessor.region-split-size`='%s'", regionSize))
+		rows := c.query("show config where name like '%region-split-size%';")
+		for rows.Next() {
+			var t, i, n, v string
+			rows.Scan(&t, &i, &n, &v)
+			if v != regionSize {
+				panic(v)
+			}
+		}
+	}
 }
